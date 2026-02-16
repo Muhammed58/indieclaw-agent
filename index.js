@@ -210,6 +210,7 @@ function handleFsDelete(ws, { id, path: filePath }) {
 // --- System Stats ---
 function handleSystemStats(ws, { id }) {
   const platform = os.platform();
+  const mem = platform === 'darwin' ? getDarwinMemory() : getLinuxMemory();
   const stats = {
     hostname: os.hostname(),
     platform,
@@ -220,15 +221,59 @@ function handleSystemStats(ws, { id }) {
       cores: os.cpus().length,
       usage: getCpuUsage(platform),
     },
-    memory: {
-      total: os.totalmem(),
-      free: os.freemem(),
-      used: os.totalmem() - os.freemem(),
-      usagePercent: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100),
-    },
+    memory: mem,
     disk: getDiskUsage(platform),
   };
   reply(ws, id, stats);
+}
+
+function getDarwinMemory() {
+  const total = os.totalmem();
+  try {
+    const out = execSync('vm_stat', { timeout: 3000 }).toString();
+    const pageMatch = out.match(/page size of (\d+) bytes/);
+    const pageSize = pageMatch ? parseInt(pageMatch[1], 10) : 16384;
+
+    const val = (key) => {
+      const m = out.match(new RegExp(key + ':\\s+(\\d+)'));
+      return m ? parseInt(m[1], 10) : 0;
+    };
+
+    const wired = val('Pages wired down');
+    const active = val('Pages active');
+    const compressed = val('Pages occupied by compressor');
+    const purgeable = val('Pages purgeable');
+
+    // Used = wired + active (minus purgeable) + compressed — matches Activity Monitor
+    const used = (wired + active - purgeable + compressed) * pageSize;
+    const free = total - used;
+    return {
+      total,
+      free: Math.max(free, 0),
+      used: Math.min(used, total),
+      usagePercent: Math.round((Math.min(used, total) / total) * 100),
+    };
+  } catch {
+    // Fallback to Node.js (inaccurate on macOS but better than nothing)
+    const free = os.freemem();
+    return {
+      total,
+      free,
+      used: total - free,
+      usagePercent: Math.round(((total - free) / total) * 100),
+    };
+  }
+}
+
+function getLinuxMemory() {
+  const total = os.totalmem();
+  const free = os.freemem();
+  return {
+    total,
+    free,
+    used: total - free,
+    usagePercent: Math.round(((total - free) / total) * 100),
+  };
 }
 
 function getCpuUsage(platform) {
@@ -251,23 +296,32 @@ function getCpuUsage(platform) {
 
 function getDiskUsage(platform) {
   try {
-    const cmd = platform === 'darwin' ? 'df -k /' : 'df -k / --output=source,size,used,avail,pcent,target';
-    const out = execSync(cmd, { timeout: 5000 }).toString();
+    if (platform === 'darwin') {
+      // macOS APFS: "Used" column only shows one volume's data
+      // Calculate used = total - available for accurate results
+      const out = execSync('df -k /', { timeout: 5000 }).toString();
+      const lines = out.trim().split('\n').slice(1);
+      return lines.map((line) => {
+        const parts = line.trim().split(/\s+/);
+        // Columns: Filesystem 1K-blocks Used Available Capacity iused ifree %iused Mounted
+        const total = parseInt(parts[1], 10) * 1024;
+        const available = parseInt(parts[3], 10) * 1024;
+        const used = total - available;
+        return {
+          filesystem: parts[0],
+          mount: parts[8] || '/',
+          total,
+          used,
+          available,
+          usagePercent: Math.round((used / total) * 100),
+        };
+      });
+    }
+    // Linux
+    const out = execSync('df -k / --output=source,size,used,avail,pcent,target', { timeout: 5000 }).toString();
     const lines = out.trim().split('\n').slice(1);
     return lines.map((line) => {
       const parts = line.trim().split(/\s+/);
-      if (platform === 'darwin') {
-        // macOS df: Filesystem 512-blocks Used Available Capacity ...
-        // df -k gives 1K-blocks
-        return {
-          filesystem: parts[0],
-          mount: parts[8] || parts[5] || '/',
-          total: parseInt(parts[1], 10) * 1024,
-          used: parseInt(parts[2], 10) * 1024,
-          available: parseInt(parts[3], 10) * 1024,
-          usagePercent: parseInt(parts[4], 10),
-        };
-      }
       return {
         filesystem: parts[0],
         total: parseInt(parts[1], 10) * 1024,
@@ -489,11 +543,88 @@ function handleTerminalStart(ws, { id }) {
     }
   }
 
-  // Fallback: child_process.spawn
   const { spawn } = require('child_process');
-  const proc = spawn(shell, ['-i'], {
+
+  // macOS: use Python pty module (script(1) fails with piped stdin on macOS)
+  if (os.platform() === 'darwin') {
+    const pythonScript = `
+import pty,os,sys,select,struct,fcntl,termios,signal
+m,s=pty.openpty()
+try:fcntl.ioctl(s,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0))
+except:pass
+p=os.fork()
+if p==0:
+    os.close(m);os.setsid();fcntl.ioctl(s,termios.TIOCSCTTY,0)
+    os.dup2(s,0);os.dup2(s,1);os.dup2(s,2)
+    if s>2:os.close(s)
+    sh=os.environ.get('SHELL','/bin/zsh')
+    os.execvp(sh,[sh])
+os.close(s);buf=b''
+MK=b'\\x1b]9999;';EN=b'\\x07'
+while True:
+    try:r,_,_=select.select([m,0],[],[])
+    except:break
+    if m in r:
+        try:d=os.read(m,16384)
+        except OSError:break
+        if not d:break
+        try:os.write(1,d)
+        except:break
+    if 0 in r:
+        try:d=os.read(0,4096)
+        except OSError:break
+        if not d:break
+        buf+=d
+        while MK in buf:
+            i=buf.index(MK)
+            if i>0:os.write(m,buf[:i]);buf=buf[i:]
+            try:j=buf.index(EN)
+            except ValueError:break
+            c=buf[len(MK):j].decode().split(',')
+            try:
+                fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',int(c[1]),int(c[0]),0,0))
+                os.kill(p,signal.SIGWINCH)
+            except:pass
+            buf=buf[j+1:]
+        if buf and MK not in buf:os.write(m,buf);buf=b''
+try:os.kill(p,signal.SIGTERM)
+except:pass
+try:os.waitpid(p,0)
+except:pass
+`;
+    const proc = spawn('python3', ['-u', '-c', pythonScript], {
+      cwd: os.homedir(),
+      env: { ...process.env, TERM: 'xterm-256color' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    proc._ws = ws;
+    proc._isPty = false;
+    proc._hasPtyResize = true;
+
+    proc.stdout.on('data', (data) => {
+      send(ws, { type: 'terminal.output', id, data: data.toString() });
+    });
+
+    proc.stderr.on('data', (data) => {
+      send(ws, { type: 'terminal.output', id, data: data.toString() });
+    });
+
+    proc.on('exit', (exitCode) => {
+      send(ws, { type: 'terminal.exit', id, exitCode: exitCode ?? 0 });
+      terminals.delete(id);
+    });
+
+    terminals.set(id, proc);
+    return reply(ws, id, { pid: proc.pid });
+  }
+
+  // Linux: use script(1) to allocate a real PTY
+  const scriptArgs = ['-q', '-c', shell, '/dev/null'];
+
+  const proc = spawn('script', scriptArgs, {
     cwd: os.homedir(),
-    env: { ...process.env, TERM: 'dumb' },
+    env: { ...process.env, TERM: 'xterm-256color' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -529,11 +660,13 @@ function handleTerminalInput(ws, { id, data }) {
 
 function handleTerminalResize(ws, { id, cols, rows }) {
   const term = terminals.get(id);
-  if (!term) return replyError(ws, id, 'Terminal not found');
+  if (!term) return;
   if (term._isPty && term.resize) {
     term.resize(cols, rows);
+  } else if (term._hasPtyResize) {
+    // Python PTY: send resize via custom OSC escape sequence
+    term.stdin.write(`\x1b]9999;${cols},${rows}\x07`);
   }
-  // fallback processes don't support resize
 }
 
 function handleTerminalStop(ws, { id }) {
