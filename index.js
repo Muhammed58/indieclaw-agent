@@ -119,6 +119,12 @@ async function handleMessage(ws, msg) {
         return handleFsDelete(ws, msg);
       case 'system.stats':
         return handleSystemStats(ws, msg);
+      case 'system.top.cpu':
+        return handleTopCpu(ws, msg);
+      case 'system.top.memory':
+        return handleTopMemory(ws, msg);
+      case 'system.disk.details':
+        return handleDiskDetails(ws, msg);
       case 'docker.list':
         return handleDockerList(ws, msg);
       case 'docker.logs':
@@ -274,6 +280,110 @@ function getDiskUsage(platform) {
   } catch {
     return [];
   }
+}
+
+// --- Top Processes (CPU) ---
+function handleTopCpu(ws, { id }) {
+  const platform = os.platform();
+  const cmd = platform === 'darwin'
+    ? 'ps aux -r | head -11'
+    : 'ps aux --sort=-%cpu | head -11';
+
+  exec(cmd, { timeout: 5000 }, (err, stdout) => {
+    if (err) return replyError(ws, id, err.message);
+    const processes = parsePsOutput(stdout);
+    reply(ws, id, { processes, timestamp: Date.now() });
+  });
+}
+
+// --- Top Processes (Memory) ---
+function handleTopMemory(ws, { id }) {
+  const platform = os.platform();
+  const cmd = platform === 'darwin'
+    ? 'ps aux -m | head -11'
+    : 'ps aux --sort=-%mem | head -11';
+
+  exec(cmd, { timeout: 5000 }, (err, stdout) => {
+    if (err) return replyError(ws, id, err.message);
+    const processes = parsePsOutput(stdout);
+    reply(ws, id, { processes, timestamp: Date.now() });
+  });
+}
+
+function parsePsOutput(stdout) {
+  const lines = stdout.trim().split('\n').slice(1); // skip header
+  return lines.map((line) => {
+    const parts = line.trim().split(/\s+/);
+    // ps aux columns: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+    return {
+      pid: parseInt(parts[1], 10),
+      name: parts.slice(10).join(' '),
+      cpu: parseFloat(parts[2]) || 0,
+      memory: parseFloat(parts[3]) || 0,
+    };
+  });
+}
+
+// --- Disk Details ---
+function handleDiskDetails(ws, { id }) {
+  const platform = os.platform();
+
+  const virtualFs = new Set([
+    'devtmpfs', 'tmpfs', 'sysfs', 'proc', 'devpts', 'securityfs',
+    'cgroup', 'cgroup2', 'pstore', 'debugfs', 'hugetlbfs', 'mqueue',
+    'configfs', 'fusectl', 'tracefs', 'bpf', 'overlay', 'nsfs',
+    'autofs', 'binfmt_misc', 'efivarfs',
+  ]);
+
+  const cmd = 'df -kT';
+
+  exec(cmd, { timeout: 5000 }, (err, stdout) => {
+    if (err) {
+      // Fallback: df -k without -T (macOS sometimes lacks -T)
+      return exec('df -k', { timeout: 5000 }, (err2, stdout2) => {
+        if (err2) return replyError(ws, id, err2.message);
+        const partitions = parseDfOutput(stdout2, false, virtualFs);
+        reply(ws, id, { partitions, timestamp: Date.now() });
+      });
+    }
+    const partitions = parseDfOutput(stdout, true, virtualFs);
+    reply(ws, id, { partitions, timestamp: Date.now() });
+  });
+}
+
+function parseDfOutput(stdout, hasType, virtualFs) {
+  const lines = stdout.trim().split('\n').slice(1);
+  return lines
+    .map((line) => {
+      const parts = line.trim().split(/\s+/);
+      if (hasType) {
+        // Filesystem Type 1K-blocks Used Available Use% Mounted
+        const fsType = parts[1];
+        if (virtualFs.has(fsType)) return null;
+        return {
+          filesystem: parts[0],
+          type: fsType,
+          total: parseInt(parts[2], 10) * 1024,
+          used: parseInt(parts[3], 10) * 1024,
+          available: parseInt(parts[4], 10) * 1024,
+          usagePercent: parseInt(parts[5], 10) || 0,
+          mount: parts.slice(6).join(' ') || '/',
+        };
+      }
+      // Filesystem 1K-blocks Used Available Use% Mounted
+      const fsName = parts[0];
+      if (fsName === 'devfs' || fsName === 'map' || fsName.startsWith('map ')) return null;
+      return {
+        filesystem: fsName,
+        type: 'unknown',
+        total: parseInt(parts[1], 10) * 1024,
+        used: parseInt(parts[2], 10) * 1024,
+        available: parseInt(parts[3], 10) * 1024,
+        usagePercent: parseInt(parts[4], 10) || 0,
+        mount: parts.slice(5).join(' ') || '/',
+      };
+    })
+    .filter(Boolean);
 }
 
 // --- Docker ---
