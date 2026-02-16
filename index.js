@@ -503,16 +503,37 @@ function handleSystemUpdate(ws, { id }) {
   const { spawn } = require('child_process');
   const platform = os.platform();
 
-  // Build an update script that runs after the agent exits
-  const script = platform === 'win32'
-    ? `@echo off
+  // Resolve the full path to npm so detached scripts can find it
+  let npmPath = 'npm';
+  try {
+    npmPath = execSync('which npm', { timeout: 3000 }).toString().trim();
+  } catch {}
+
+  let script;
+  if (platform === 'win32') {
+    script = `@echo off
 timeout /t 2 /nobreak >nul
 npm install -g indieclaw-agent@latest
-start "" indieclaw-agent`
-    : `#!/bin/bash
+start "" indieclaw-agent`;
+  } else {
+    // Detect restart method: systemd service, launchd, or nohup fallback
+    script = `#!/bin/bash
+exec > /tmp/indieclaw-update.log 2>&1
+echo "[$(date)] Starting agent update..."
 sleep 2
-npm install -g indieclaw-agent@latest
-nohup indieclaw-agent > /tmp/indieclaw-agent.log 2>&1 &`;
+${npmPath} install -g indieclaw-agent@latest
+echo "[$(date)] Install complete, restarting..."
+if [ -f /etc/systemd/system/indieclaw-agent.service ]; then
+  systemctl restart indieclaw-agent
+  echo "[$(date)] Restarted via systemctl"
+elif launchctl list com.indieclaw.agent &>/dev/null 2>&1; then
+  launchctl kickstart -k gui/$(id -u)/com.indieclaw.agent
+  echo "[$(date)] Restarted via launchctl"
+else
+  nohup indieclaw-agent > /tmp/indieclaw-agent.log 2>&1 &
+  echo "[$(date)] Restarted via nohup (pid $!)"
+fi`;
+  }
 
   const ext = platform === 'win32' ? '.bat' : '.sh';
   const scriptPath = path.join(os.tmpdir(), `indieclaw-update${ext}`);
