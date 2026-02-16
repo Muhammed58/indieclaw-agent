@@ -135,6 +135,10 @@ async function handleMessage(ws, msg) {
         return handleDockerAction(ws, msg, 'stop');
       case 'docker.restart':
         return handleDockerAction(ws, msg, 'restart');
+      case 'system.version':
+        return handleSystemVersion(ws, msg);
+      case 'system.update':
+        return handleSystemUpdate(ws, msg);
       case 'cron.list':
         return handleCronList(ws, msg);
       case 'terminal.start':
@@ -484,6 +488,49 @@ function handleDockerAction(ws, { id, containerId }, action) {
     if (err) return replyError(ws, id, err.message);
     reply(ws, id, { success: true, output: stdout.trim() });
   });
+}
+
+// --- Agent Version & Update ---
+function handleSystemVersion(ws, { id }) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+  exec('npm view indieclaw-agent version', { timeout: 10000 }, (err, stdout) => {
+    const latest = err ? null : stdout.trim();
+    reply(ws, id, { current: pkg.version, latest });
+  });
+}
+
+function handleSystemUpdate(ws, { id }) {
+  const { spawn } = require('child_process');
+  const platform = os.platform();
+
+  // Build an update script that runs after the agent exits
+  const script = platform === 'win32'
+    ? `@echo off
+timeout /t 2 /nobreak >nul
+npm install -g indieclaw-agent@latest
+start "" indieclaw-agent`
+    : `#!/bin/bash
+sleep 2
+npm install -g indieclaw-agent@latest
+nohup indieclaw-agent > /tmp/indieclaw-agent.log 2>&1 &`;
+
+  const ext = platform === 'win32' ? '.bat' : '.sh';
+  const scriptPath = path.join(os.tmpdir(), `indieclaw-update${ext}`);
+  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+
+  const child = platform === 'win32'
+    ? spawn('cmd', ['/c', scriptPath], { detached: true, stdio: 'ignore', windowsHide: true })
+    : spawn('bash', [scriptPath], { detached: true, stdio: 'ignore' });
+  child.unref();
+
+  reply(ws, id, { updating: true });
+
+  // Give time for the reply to reach the client, then exit
+  setTimeout(() => {
+    for (const [, term] of terminals) term.kill();
+    wss.close();
+    process.exit(0);
+  }, 500);
 }
 
 // --- Cron ---
