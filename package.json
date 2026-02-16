@@ -1,0 +1,42 @@
+{
+  "name": "indieclaw-agent",
+  "version": "1.0.0",
+  "description": "Manage your server from your phone. Agent for the IndieClaw mobile app.",
+  "main": "index.js",
+  "bin": {
+    "indieclaw-agent": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "vps",
+    "server",
+    "management",
+    "mobile",
+    "websocket",
+    "docker",
+    "terminal",
+    "monitoring",
+    "indieclaw"
+  ],
+  "author": "Muhammet Arslantas",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muhammetarslantas/indieclaw-agent"
+  },
+  "homepage": "https://github.com/muhammetarslantas/indieclaw-agent#readme",
+  "bugs": {
+    "url": "https://github.com/muhammetarslantas/indieclaw-agent/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.0.0"
+  }
+}
