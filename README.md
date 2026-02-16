@@ -1,6 +1,6 @@
 # IndieClaw Agent
 
-Manage your server from your phone. This is the server-side agent for the [IndieClaw](https://github.com/muhammetarslantas/indieclaw) mobile app.
+Manage your server from your phone. This is the server-side agent for the [IndieClaw](https://github.com/Muhammed58/indieclaw) mobile app.
 
 ## Quick Start
 

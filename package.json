@@ -24,11 +24,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/muhammetarslantas/indieclaw-agent"
+    "url": "https://github.com/Muhammed58/indieclaw-agent"
   },
-  "homepage": "https://github.com/muhammetarslantas/indieclaw-agent#readme",
+  "homepage": "https://github.com/Muhammed58/indieclaw-agent#readme",
   "bugs": {
-    "url": "https://github.com/muhammetarslantas/indieclaw-agent/issues"
+    "url": "https://github.com/Muhammed58/indieclaw-agent/issues"
   },
   "engines": {
     "node": ">=18.0.0"
