@@ -455,46 +455,85 @@ function handleCronList(ws, { id }) {
   });
 }
 
-// --- Terminal (PTY) ---
+// --- Terminal (PTY with child_process fallback) ---
 function handleTerminalStart(ws, { id }) {
-  if (!pty) {
-    return replyError(ws, id, 'Terminal not available (node-pty not installed)');
+  const shell = process.env.SHELL || '/bin/bash';
+
+  // Try node-pty first
+  if (pty) {
+    try {
+      const term = pty.spawn(shell, [], {
+        name: 'xterm-256color',
+        cols: 80,
+        rows: 24,
+        cwd: os.homedir(),
+        env: { ...process.env, TERM: 'xterm-256color' },
+      });
+
+      term._ws = ws;
+      term._isPty = true;
+      terminals.set(id, term);
+
+      term.onData((data) => {
+        send(ws, { type: 'terminal.output', id, data });
+      });
+
+      term.onExit(({ exitCode }) => {
+        send(ws, { type: 'terminal.exit', id, exitCode });
+        terminals.delete(id);
+      });
+
+      return reply(ws, id, { pid: term.pid });
+    } catch (err) {
+      console.log(`[agent] node-pty spawn failed (${err.message}), using fallback`);
+    }
   }
 
-  const shell = process.env.SHELL || '/bin/bash';
-  const term = pty.spawn(shell, [], {
-    name: 'xterm-256color',
-    cols: 80,
-    rows: 24,
+  // Fallback: child_process.spawn
+  const { spawn } = require('child_process');
+  const proc = spawn(shell, ['-i'], {
     cwd: os.homedir(),
-    env: { ...process.env, TERM: 'xterm-256color' },
+    env: { ...process.env, TERM: 'dumb' },
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-  term._ws = ws;
-  terminals.set(id, term);
+  proc._ws = ws;
+  proc._isPty = false;
 
-  term.onData((data) => {
-    send(ws, { type: 'terminal.output', id, data });
+  proc.stdout.on('data', (data) => {
+    send(ws, { type: 'terminal.output', id, data: data.toString() });
   });
 
-  term.onExit(({ exitCode }) => {
-    send(ws, { type: 'terminal.exit', id, exitCode });
+  proc.stderr.on('data', (data) => {
+    send(ws, { type: 'terminal.output', id, data: data.toString() });
+  });
+
+  proc.on('exit', (exitCode) => {
+    send(ws, { type: 'terminal.exit', id, exitCode: exitCode ?? 0 });
     terminals.delete(id);
   });
 
-  reply(ws, id, { pid: term.pid });
+  terminals.set(id, proc);
+  reply(ws, id, { pid: proc.pid });
 }
 
 function handleTerminalInput(ws, { id, data }) {
   const term = terminals.get(id);
   if (!term) return replyError(ws, id, 'Terminal not found');
-  term.write(data);
+  if (term._isPty) {
+    term.write(data);
+  } else {
+    term.stdin.write(data);
+  }
 }
 
 function handleTerminalResize(ws, { id, cols, rows }) {
   const term = terminals.get(id);
   if (!term) return replyError(ws, id, 'Terminal not found');
-  term.resize(cols, rows);
+  if (term._isPty && term.resize) {
+    term.resize(cols, rows);
+  }
+  // fallback processes don't support resize
 }
 
 function handleTerminalStop(ws, { id }) {
