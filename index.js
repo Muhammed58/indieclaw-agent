@@ -541,9 +541,19 @@ echo "[$(date)] Done (exit code: $?)"`;
   const scriptPath = path.join(os.tmpdir(), `indieclaw-update${ext}`);
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
-  const child = platform === 'win32'
-    ? spawn('cmd', ['/c', scriptPath], { detached: true, stdio: 'ignore', windowsHide: true })
-    : spawn('bash', [scriptPath], { detached: true, stdio: 'ignore' });
+  let child;
+  if (platform === 'win32') {
+    child = spawn('cmd', ['/c', scriptPath], { detached: true, stdio: 'ignore', windowsHide: true });
+  } else if (platform === 'linux') {
+    // systemd-run launches the script in a separate cgroup scope,
+    // so it won't be killed when systemd restarts the agent service
+    child = spawn('systemd-run', ['--scope', '--unit=indieclaw-update', 'bash', scriptPath], {
+      detached: true,
+      stdio: 'ignore'
+    });
+  } else {
+    child = spawn('bash', [scriptPath], { detached: true, stdio: 'ignore' });
+  }
   child.unref();
 
   reply(ws, id, { updating: true });
