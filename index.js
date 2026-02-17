@@ -529,23 +529,12 @@ timeout /t 2 /nobreak >nul
 npm install -g indieclaw-agent@latest
 start "" indieclaw-agent`;
   } else {
-    // Detect restart method: systemd service, launchd, or nohup fallback
     script = `#!/bin/bash
 exec > /tmp/indieclaw-update.log 2>&1
 echo "[$(date)] Starting agent update..."
 sleep 2
-${npmPath} install -g indieclaw-agent@latest
-echo "[$(date)] Install complete, restarting..."
-if [ -f /etc/systemd/system/indieclaw-agent.service ]; then
-  systemctl restart indieclaw-agent
-  echo "[$(date)] Restarted via systemctl"
-elif launchctl list com.indieclaw.agent &>/dev/null 2>&1; then
-  launchctl kickstart -k gui/$(id -u)/com.indieclaw.agent
-  echo "[$(date)] Restarted via launchctl"
-else
-  nohup indieclaw-agent > /tmp/indieclaw-agent.log 2>&1 &
-  echo "[$(date)] Restarted via nohup (pid $!)"
-fi`;
+sudo ${npmPath} install -g indieclaw-agent@latest && sudo systemctl restart indieclaw-agent
+echo "[$(date)] Done (exit code: $?)"`;
   }
 
   const ext = platform === 'win32' ? '.bat' : '.sh';
