@@ -765,7 +765,7 @@ function handleChatSend(ws, { id, messages, openclawToken, openclawPort, opencla
   const host = openclawHost || '127.0.0.1';
 
   const body = JSON.stringify({
-    model: 'moltbot',
+    model: 'openclaw:main',
     messages,
     stream: true,
   });
@@ -779,7 +779,7 @@ function handleChatSend(ws, { id, messages, openclawToken, openclawPort, opencla
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${openclawToken}`,
-        'x-moltbot-agent-id': 'main',
+        'x-openclaw-agent-id': 'main',
       },
     },
     (res) => {
