@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const http = require('http');
 
 // --- Configuration ---
 const PORT = parseInt(process.env.INDIECLAW_PORT || '3100', 10);
@@ -34,6 +35,7 @@ try {
 // --- WebSocket Server ---
 const wss = new WebSocketServer({ port: PORT });
 const terminals = new Map(); // id -> pty process
+const activeChats = new Map(); // id -> http.ClientRequest
 
 console.log('');
 console.log('  ╔═══════════════════════════════════════╗');
@@ -85,6 +87,13 @@ wss.on('connection', (ws) => {
       if (term._ws === ws) {
         term.kill();
         terminals.delete(id);
+      }
+    }
+    // Clean up any active chat streams owned by this connection
+    for (const [id, req] of activeChats) {
+      if (req._ws === ws) {
+        req.destroy();
+        activeChats.delete(id);
       }
     }
   });
@@ -149,6 +158,10 @@ async function handleMessage(ws, msg) {
         return handleTerminalResize(ws, msg);
       case 'terminal.stop':
         return handleTerminalStop(ws, msg);
+      case 'chat.send':
+        return handleChatSend(ws, msg);
+      case 'chat.stop':
+        return handleChatStop(ws, msg);
       default:
         return replyError(ws, id, `Unknown message type: ${type}`);
     }
@@ -556,10 +569,11 @@ fi`;
 
 // --- Cron ---
 function handleCronList(ws, { id }) {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown';
   exec('crontab -l', { timeout: 5000 }, (err, stdout) => {
     if (err) {
       if (err.message.includes('no crontab')) {
-        return reply(ws, id, []);
+        return reply(ws, id, { timezone, jobs: [] });
       }
       return replyError(ws, id, err.message);
     }
@@ -573,7 +587,7 @@ function handleCronList(ws, { id }) {
         const command = parts.slice(5).join(' ');
         return { schedule, command, raw: line.trim() };
       });
-    reply(ws, id, jobs);
+    reply(ws, id, { timezone, jobs });
   });
 }
 
@@ -745,16 +759,121 @@ function handleTerminalStop(ws, { id }) {
   reply(ws, id, { stopped: true });
 }
 
+// --- Chat (OpenClaw Proxy) ---
+function handleChatSend(ws, { id, messages, openclawToken, openclawPort, openclawHost }) {
+  const port = openclawPort || 18789;
+  const host = openclawHost || '127.0.0.1';
+
+  const body = JSON.stringify({
+    model: 'moltbot',
+    messages,
+    stream: true,
+  });
+
+  const req = http.request(
+    {
+      hostname: host,
+      port,
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${openclawToken}`,
+        'x-moltbot-agent-id': 'main',
+      },
+    },
+    (res) => {
+      if (res.statusCode !== 200) {
+        let errorBody = '';
+        res.on('data', (chunk) => (errorBody += chunk));
+        res.on('end', () => {
+          send(ws, { type: 'chat.done', id, error: `OpenClaw error ${res.statusCode}: ${errorBody}` });
+          activeChats.delete(id);
+        });
+        return;
+      }
+
+      let buffer = '';
+      let sentDone = false;
+
+      res.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+          if (trimmed === 'data: [DONE]') {
+            if (!sentDone) {
+              sentDone = true;
+              send(ws, { type: 'chat.done', id });
+              activeChats.delete(id);
+            }
+            return;
+          }
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const json = JSON.parse(trimmed.slice(6));
+              const content = json.choices?.[0]?.delta?.content;
+              if (content) {
+                send(ws, { type: 'chat.stream', id, content });
+              }
+            } catch {}
+          }
+        }
+      });
+
+      res.on('end', () => {
+        if (!sentDone) {
+          sentDone = true;
+          send(ws, { type: 'chat.done', id });
+          activeChats.delete(id);
+        }
+      });
+
+      res.on('error', (err) => {
+        if (!sentDone) {
+          sentDone = true;
+          send(ws, { type: 'chat.done', id, error: err.message });
+          activeChats.delete(id);
+        }
+      });
+    }
+  );
+
+  req.on('error', (err) => {
+    send(ws, { type: 'chat.done', id, error: `Connection failed: ${err.message}` });
+    activeChats.delete(id);
+  });
+
+  req._ws = ws;
+  activeChats.set(id, req);
+  req.write(body);
+  req.end();
+}
+
+function handleChatStop(ws, { id, chatId }) {
+  const req = activeChats.get(chatId);
+  if (req) {
+    req.destroy();
+    activeChats.delete(chatId);
+  }
+  reply(ws, id, { stopped: true });
+}
+
 // --- Graceful Shutdown ---
 process.on('SIGINT', () => {
   console.log('\n[agent] Shutting down...');
   for (const [, term] of terminals) term.kill();
+  for (const [, req] of activeChats) req.destroy();
   wss.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   for (const [, term] of terminals) term.kill();
+  for (const [, req] of activeChats) req.destroy();
   wss.close();
   process.exit(0);
 });
