@@ -110,11 +110,21 @@ echo -e "  ${GREEN}✓${NC} IP: ${MACHINE_IP}"
 # Step 5: Check OpenClaw
 echo -e "${YELLOW}[5/5]${NC} Checking OpenClaw..."
 OPENCLAW_STATUS="not detected"
-if curl -s --max-time 2 http://127.0.0.1:18789/v1/models > /dev/null 2>&1; then
-  OPENCLAW_STATUS="detected on port 18789"
-  echo -e "  ${GREEN}✓${NC} OpenClaw detected on port 18789"
+# Check via CLI (gateway status), then via process, then via binary existence
+if command -v openclaw &> /dev/null; then
+  OC_STATUS=$(openclaw gateway status 2>&1 || true)
+  if echo "$OC_STATUS" | grep -qi "running\|active"; then
+    OPENCLAW_STATUS="running"
+    echo -e "  ${GREEN}✓${NC} OpenClaw gateway is running"
+  elif pgrep -f "openclaw.gateway\|openclaw-gateway" > /dev/null 2>&1; then
+    OPENCLAW_STATUS="running"
+    echo -e "  ${GREEN}✓${NC} OpenClaw gateway process detected"
+  else
+    OPENCLAW_STATUS="installed (gateway not running)"
+    echo -e "  ${YELLOW}—${NC} OpenClaw installed but gateway not running. Start with: openclaw gateway run"
+  fi
 else
-  echo -e "  ${YELLOW}—${NC} OpenClaw not detected on port 18789 (optional, for AI features)"
+  echo -e "  ${YELLOW}—${NC} OpenClaw not installed (optional, for AI features)"
 fi
 
 # Build deep link

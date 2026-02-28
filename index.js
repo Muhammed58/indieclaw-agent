@@ -144,63 +144,52 @@ try {
 }
 
 // --- OpenClaw Detection ---
-const OPENCLAW_PORTS = [18789, 8080, 11434, 1234, 8000];
-
-function tryOpenClawPort(port) {
+function detectOpenClaw() {
   return new Promise((resolve) => {
-    const req = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path: '/v1/models',
-        method: 'GET',
-        timeout: 2000,
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (chunk) => (body += chunk));
-        res.on('end', () => {
-          try {
-            const json = JSON.parse(body);
-            const models = (json.data || []).map((m) => m.id);
-            if (models.length > 0) {
-              resolve({ available: true, models, port });
-            } else {
-              resolve({ available: false, models: [], port });
-            }
-          } catch {
-            resolve({ available: false, models: [], port });
-          }
-        });
+    // Method 1: Use `openclaw gateway status` CLI (most reliable)
+    exec('openclaw gateway status 2>&1', { timeout: 5000 }, (err, stdout) => {
+      const output = (stdout || '').toLowerCase();
+      // "running" in output means gateway is active
+      if (!err && (output.includes('running') || output.includes('active'))) {
+        // Try to get the gateway port from config
+        const portMatch = (stdout || '').match(/:(\d+)/);
+        const port = portMatch ? parseInt(portMatch[1], 10) : 18789;
+        return resolve({ available: true, models: ['openclaw'], port });
       }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ available: false, models: [], port });
-    });
-    req.on('error', () => {
-      resolve({ available: false, models: [], port });
-    });
-    req.end();
-  });
-}
 
-async function detectOpenClaw() {
-  // Try all common ports in parallel
-  const results = await Promise.all(OPENCLAW_PORTS.map(tryOpenClawPort));
-  const found = results.find((r) => r.available);
-  if (found) {
-    return { available: true, models: found.models, port: found.port };
-  }
-  return { available: false, models: [], port: null };
+      // Method 2: Check if openclaw binary exists at all
+      exec('command -v openclaw 2>/dev/null', { timeout: 2000 }, (err2, binPath) => {
+        if (err2 || !binPath?.trim()) {
+          // Method 3: Check if openclaw-gateway process is running
+          exec('pgrep -f "openclaw.gateway\\|openclaw-gateway" 2>/dev/null', { timeout: 2000 }, (err3, pid) => {
+            if (!err3 && pid?.trim()) {
+              return resolve({ available: true, models: ['openclaw'], port: 18789 });
+            }
+            return resolve({ available: false, models: [], port: null });
+          });
+          return;
+        }
+
+        // Binary exists but gateway might not be running — try health check
+        exec('openclaw gateway health --url ws://127.0.0.1:18789 2>&1', { timeout: 5000 }, (err4, healthOut) => {
+          const hOutput = (healthOut || '').toLowerCase();
+          if (!err4 && (hOutput.includes('ok') || hOutput.includes('healthy') || hOutput.includes('reachable'))) {
+            return resolve({ available: true, models: ['openclaw'], port: 18789 });
+          }
+          // Binary installed but gateway not running
+          return resolve({ available: false, models: [], port: null });
+        });
+      });
+    });
+  });
 }
 
 // Run detection on startup
 detectOpenClaw().then((oc) => {
   if (oc.available) {
-    console.log(`  [OpenClaw] Detected on port ${oc.port}! Models: ${oc.models.join(', ')}`);
+    console.log(`  [OpenClaw] Detected (gateway running on port ${oc.port})`);
   } else {
-    console.log(`  [OpenClaw] Not detected on ports ${OPENCLAW_PORTS.join(', ')}`);
+    console.log('  [OpenClaw] Not detected');
   }
 });
 
