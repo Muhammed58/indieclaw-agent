@@ -90,6 +90,7 @@ if (TLS_ENABLED) {
 
 const terminals = new Map(); // id -> pty process
 const activeChats = new Map(); // id -> http.ClientRequest
+const activeSearches = new Map(); // ws -> child_process (one search per connection)
 
 // --- Deep Link & QR Code ---
 function getMachineIP() {
@@ -259,7 +260,9 @@ wss.on('connection', (ws) => {
     }
 
     // Route message
-    handleMessage(ws, msg);
+    handleMessage(ws, msg).catch((err) => {
+      console.error('[handleMessage] Unhandled error:', err.message || err);
+    });
   });
 
   ws.on('close', () => {
@@ -276,6 +279,12 @@ wss.on('connection', (ws) => {
         req.destroy();
         activeChats.delete(id);
       }
+    }
+    // Kill any active search process for this connection
+    const search = activeSearches.get(ws);
+    if (search) {
+      search.kill();
+      activeSearches.delete(ws);
     }
   });
 });
@@ -354,9 +363,9 @@ async function handleMessage(ws, msg) {
       case 'cron.history':
         return handleCronHistory(ws, msg);
       case 'agent.list':
-        return handleAgentList(ws, msg);
+        return await handleAgentList(ws, msg);
       case 'agent.logs':
-        return handleAgentLogs(ws, msg);
+        return await handleAgentLogs(ws, msg);
       default:
         return replyError(ws, id, `Unknown message type: ${type}`);
     }
@@ -1078,7 +1087,7 @@ function handleLogsSystem(ws, { id, lines = 200 }) {
   const platform = os.platform();
 
   if (platform === 'linux') {
-    exec(`journalctl -n ${lines} --no-pager -o json`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
+    exec(`journalctl -n ${lines} --no-pager --since "1 hour ago" -o json`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
       if (err) return replyError(ws, id, err.message);
       try {
         const entries = stdout.trim().split('\n').filter(Boolean).map((line) => {
@@ -1137,32 +1146,44 @@ function handleLogsSystem(ws, { id, lines = 200 }) {
 function handleLogsSearch(ws, { id, query, lines = 100 }) {
   const platform = os.platform();
   // Sanitize query to prevent command injection
-  const safeQuery = query.replace(/["`$\\]/g, '');
+  const safeQuery = query.replace(/["`$\\!;']/g, '');
 
-  if (platform === 'linux') {
-    exec(`journalctl -n ${lines} --no-pager -g "${safeQuery}"`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
-      if (err) return replyError(ws, id, err.message);
-      const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
-        timestamp: null,
-        level: 'info',
-        message: line,
-        source: '',
-      }));
-      reply(ws, id, entries);
-    });
-  } else {
-    // macOS
-    exec(`grep -i "${safeQuery}" /var/log/system.log | tail -${lines}`, { timeout: 10000 }, (err, stdout) => {
-      if (err) return replyError(ws, id, err.message || 'No matches found');
-      const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
-        timestamp: null,
-        level: 'info',
-        message: line,
-        source: '',
-      }));
-      reply(ws, id, entries);
-    });
+  if (!safeQuery || safeQuery.length < 2) {
+    return reply(ws, id, []);
   }
+
+  // Kill any previous search for this connection to prevent pile-up
+  const prev = activeSearches.get(ws);
+  if (prev) {
+    prev.kill();
+    activeSearches.delete(ws);
+  }
+
+  let cmd;
+  if (platform === 'linux') {
+    // --since "24h ago" limits search scope instead of grepping entire journal
+    cmd = `journalctl -n ${lines} --no-pager --since "24 hours ago" -g "${safeQuery}"`;
+  } else {
+    cmd = `grep -i "${safeQuery}" /var/log/system.log | tail -${lines}`;
+  }
+
+  const child = exec(cmd, { timeout: 10000, maxBuffer: 1024 * 1024 * 2 }, (err, stdout) => {
+    activeSearches.delete(ws);
+    if (err) {
+      // journalctl returns exit code 1 when no matches found — not an error
+      if (err.killed) return; // process was killed by a newer search
+      return reply(ws, id, []);
+    }
+    const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
+      timestamp: null,
+      level: 'info',
+      message: line,
+      source: '',
+    }));
+    reply(ws, id, entries);
+  });
+
+  activeSearches.set(ws, child);
 }
 
 // --- Cron History ---
@@ -1207,17 +1228,21 @@ function handleCronHistory(ws, { id }) {
 
 // --- Agent List (OpenClaw Models) ---
 async function handleAgentList(ws, { id }) {
-  const oc = await detectOpenClaw();
-  if (oc.available) {
-    const models = oc.models.map((modelId) => ({
-      id: modelId,
-      name: modelId,
-      status: 'running',
-      port: oc.port,
-    }));
-    return reply(ws, id, models);
+  try {
+    const oc = await detectOpenClaw();
+    if (oc.available) {
+      const models = oc.models.map((modelId) => ({
+        id: modelId,
+        name: modelId,
+        status: 'running',
+        port: oc.port,
+      }));
+      return reply(ws, id, models);
+    }
+    reply(ws, id, []);
+  } catch (err) {
+    replyError(ws, id, 'OpenClaw detection failed: ' + (err.message || String(err)));
   }
-  reply(ws, id, []);
 }
 
 // --- Agent Logs ---
