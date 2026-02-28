@@ -143,41 +143,67 @@ try {
   // qrcode-terminal not installed, skip QR display
 }
 
-// --- OpenClaw Detection ---
+// --- OpenClaw Detection & Config ---
+const OPENCLAW_CONFIG_PATHS = [
+  path.join(os.homedir(), '.openclaw', 'openclaw.json'),
+  path.join(os.homedir(), '.openclaw', 'openclaw.json5'),
+];
+
+// Read OpenClaw gateway config (port + auth token) from local config file
+function readOpenClawConfig() {
+  for (const configPath of OPENCLAW_CONFIG_PATHS) {
+    try {
+      if (!fs.existsSync(configPath)) continue;
+      let raw = fs.readFileSync(configPath, 'utf-8');
+      // Strip JSON5 comments (// and /* */) for safe JSON.parse
+      raw = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      // Strip trailing commas before } or ]
+      raw = raw.replace(/,\s*([\]}])/g, '$1');
+      const config = JSON.parse(raw);
+      const gw = config.gateway || {};
+      return {
+        port: gw.port || 18789,
+        token: gw.auth?.token || gw.auth?.password || null,
+        host: gw.bind || '127.0.0.1',
+      };
+    } catch {}
+  }
+  return { port: 18789, token: null, host: '127.0.0.1' };
+}
+
+// Cache the config on startup
+let openClawConfig = readOpenClawConfig();
+
 function detectOpenClaw() {
   return new Promise((resolve) => {
+    // Refresh config each detection
+    openClawConfig = readOpenClawConfig();
+
     // Method 1: Use `openclaw gateway status` CLI (most reliable)
     exec('openclaw gateway status 2>&1', { timeout: 5000 }, (err, stdout) => {
       const output = (stdout || '').toLowerCase();
-      // "running" in output means gateway is active
       if (!err && (output.includes('running') || output.includes('active'))) {
-        // Try to get the gateway port from config
-        const portMatch = (stdout || '').match(/:(\d+)/);
-        const port = portMatch ? parseInt(portMatch[1], 10) : 18789;
-        return resolve({ available: true, models: ['openclaw'], port });
+        return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
       }
 
-      // Method 2: Check if openclaw binary exists at all
-      exec('command -v openclaw 2>/dev/null', { timeout: 2000 }, (err2, binPath) => {
-        if (err2 || !binPath?.trim()) {
-          // Method 3: Check if openclaw-gateway process is running
-          exec('pgrep -f "openclaw.gateway\\|openclaw-gateway" 2>/dev/null', { timeout: 2000 }, (err3, pid) => {
-            if (!err3 && pid?.trim()) {
-              return resolve({ available: true, models: ['openclaw'], port: 18789 });
+      // Method 2: Check if openclaw-gateway process is running
+      exec('pgrep -f "openclaw.gateway\\|openclaw-gateway" 2>/dev/null', { timeout: 2000 }, (err3, pid) => {
+        if (!err3 && pid?.trim()) {
+          return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
+        }
+
+        // Method 3: Check if openclaw binary exists + health check
+        exec('command -v openclaw 2>/dev/null', { timeout: 2000 }, (err2, binPath) => {
+          if (err2 || !binPath?.trim()) {
+            return resolve({ available: false, models: [], port: null });
+          }
+          exec(`openclaw gateway health --url ws://127.0.0.1:${openClawConfig.port} 2>&1`, { timeout: 5000 }, (err4, healthOut) => {
+            const hOutput = (healthOut || '').toLowerCase();
+            if (!err4 && (hOutput.includes('ok') || hOutput.includes('healthy') || hOutput.includes('reachable'))) {
+              return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
             }
             return resolve({ available: false, models: [], port: null });
           });
-          return;
-        }
-
-        // Binary exists but gateway might not be running — try health check
-        exec('openclaw gateway health --url ws://127.0.0.1:18789 2>&1', { timeout: 5000 }, (err4, healthOut) => {
-          const hOutput = (healthOut || '').toLowerCase();
-          if (!err4 && (hOutput.includes('ok') || hOutput.includes('healthy') || hOutput.includes('reachable'))) {
-            return resolve({ available: true, models: ['openclaw'], port: 18789 });
-          }
-          // Binary installed but gateway not running
-          return resolve({ available: false, models: [], port: null });
         });
       });
     });
@@ -187,7 +213,7 @@ function detectOpenClaw() {
 // Run detection on startup
 detectOpenClaw().then((oc) => {
   if (oc.available) {
-    console.log(`  [OpenClaw] Detected (gateway running on port ${oc.port})`);
+    console.log(`  [OpenClaw] Detected (gateway on port ${oc.port})`);
   } else {
     console.log('  [OpenClaw] Not detected');
   }
@@ -952,9 +978,11 @@ function handleTerminalStop(ws, { id }) {
 }
 
 // --- Chat (OpenClaw Proxy) ---
-function handleChatSend(ws, { id, messages, openclawToken, openclawPort, openclawHost }) {
-  const port = openclawPort || 18789;
-  const host = openclawHost || '127.0.0.1';
+function handleChatSend(ws, { id, messages }) {
+  // Use locally-detected OpenClaw config — no need for app to send credentials
+  const port = openClawConfig.port || 18789;
+  const host = openClawConfig.host || '127.0.0.1';
+  const token = openClawConfig.token;
 
   const body = JSON.stringify({
     model: 'openclaw:main',
@@ -962,17 +990,21 @@ function handleChatSend(ws, { id, messages, openclawToken, openclawPort, opencla
     stream: true,
   });
 
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-openclaw-agent-id': 'main',
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const req = http.request(
     {
       hostname: host,
       port,
       path: '/v1/chat/completions',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${openclawToken}`,
-        'x-openclaw-agent-id': 'main',
-      },
+      headers,
     },
     (res) => {
       if (res.statusCode !== 200) {
