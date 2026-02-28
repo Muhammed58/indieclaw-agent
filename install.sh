@@ -135,12 +135,18 @@ if [ -n "$TOKEN" ]; then
   echo -e "  ${BOLD}Auth Token:${NC}"
   echo -e "  ${CYAN}${TOKEN}${NC}"
   echo ""
-  echo -e "  ${BOLD}Deep Link (paste in phone browser):${NC}"
+  echo -e "  ${BOLD}Deep Link (paste in IndieClaw app → Add Machine → Paste Link):${NC}"
   echo -e "  ${CYAN}${DEEP_LINK}${NC}"
   echo ""
-  echo -e "  ${BOLD}Or scan QR code:${NC}"
-  echo -e "  Run: ${BOLD}indieclaw-agent${NC} interactively to see QR code"
-  echo -e "  Or:  ${BOLD}sudo journalctl -u indieclaw-agent --no-pager | head -50${NC}"
+
+  # Generate QR code using the installed qrcode-terminal package
+  AGENT_MODULES=$(npm root -g 2>/dev/null)/indieclaw-agent/node_modules
+  if [ -d "$AGENT_MODULES/qrcode-terminal" ]; then
+    echo -e "  ${BOLD}Scan with IndieClaw app:${NC}"
+    echo ""
+    node -e "require('${AGENT_MODULES}/qrcode-terminal').generate('${DEEP_LINK}', {small: true}, function(qr) { qr.split('\n').forEach(function(l) { console.log('  ' + l) }) })" 2>/dev/null || true
+    echo ""
+  fi
 fi
 
 echo ""
