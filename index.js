@@ -7,10 +7,27 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
+const https = require('https');
+
+// --- Version from package.json ---
+const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+const VERSION = pkg.version;
 
 // --- Configuration ---
 const PORT = parseInt(process.env.INDIECLAW_PORT || '3100', 10);
 const TOKEN_FILE = path.join(os.homedir(), '.indieclaw-token');
+
+// --- TLS Configuration ---
+const TLS_ENABLED = process.env.INDIECLAW_TLS === '1';
+const INDIECLAW_DIR = path.join(os.homedir(), '.indieclaw');
+const DEFAULT_TLS_CERT = path.join(INDIECLAW_DIR, 'cert.pem');
+const DEFAULT_TLS_KEY = path.join(INDIECLAW_DIR, 'key.pem');
+const TLS_CERT_PATH = process.env.INDIECLAW_TLS_CERT || DEFAULT_TLS_CERT;
+const TLS_KEY_PATH = process.env.INDIECLAW_TLS_KEY || DEFAULT_TLS_KEY;
+
+// --- Push Notification Config ---
+const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const PUSH_TOKENS_FILE = path.join(INDIECLAW_DIR, 'push-tokens.json');
 
 function getOrCreateToken() {
   try {
@@ -32,27 +49,190 @@ try {
   console.log('[agent] node-pty not available — terminal feature disabled');
 }
 
+// --- TLS Setup ---
+function ensureTlsCerts() {
+  if (!fs.existsSync(INDIECLAW_DIR)) {
+    fs.mkdirSync(INDIECLAW_DIR, { recursive: true, mode: 0o700 });
+  }
+  if (!fs.existsSync(TLS_CERT_PATH) || !fs.existsSync(TLS_KEY_PATH)) {
+    console.log('[agent] Generating self-signed TLS certificate...');
+    try {
+      execSync(
+        `openssl req -x509 -newkey rsa:2048 -keyout "${TLS_KEY_PATH}" -out "${TLS_CERT_PATH}" -days 365 -nodes -subj "/CN=indieclaw-agent"`,
+        { timeout: 15000, stdio: 'pipe' }
+      );
+      fs.chmodSync(TLS_KEY_PATH, 0o600);
+      fs.chmodSync(TLS_CERT_PATH, 0o644);
+      console.log('[agent] Self-signed certificate generated.');
+    } catch (err) {
+      console.error('[agent] Failed to generate TLS certificate:', err.message);
+      process.exit(1);
+    }
+  }
+}
+
 // --- WebSocket Server ---
-const wss = new WebSocketServer({ port: PORT });
+let wss;
+let server;
+
+if (TLS_ENABLED) {
+  ensureTlsCerts();
+  const tlsOptions = {
+    cert: fs.readFileSync(TLS_CERT_PATH),
+    key: fs.readFileSync(TLS_KEY_PATH),
+  };
+  server = https.createServer(tlsOptions);
+  wss = new WebSocketServer({ server });
+  server.listen(PORT);
+} else {
+  wss = new WebSocketServer({ port: PORT });
+}
+
 const terminals = new Map(); // id -> pty process
 const activeChats = new Map(); // id -> http.ClientRequest
 
+// --- Deep Link & QR Code ---
+function getMachineIP() {
+  // Try Tailscale first
+  try {
+    const tsIP = execSync('tailscale ip -4', { timeout: 3000, stdio: 'pipe' }).toString().trim();
+    if (tsIP) return tsIP;
+  } catch {}
+
+  // Fallback to network interfaces
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
+
+const machineIP = getMachineIP();
+const deepLink = `indieclaw://connect?host=${machineIP}&port=${PORT}&token=${AUTH_TOKEN}&name=${os.hostname()}&tls=${TLS_ENABLED ? '1' : '0'}`;
+
 console.log('');
 console.log('  ╔═══════════════════════════════════════╗');
-console.log('  ║       IndieClaw Agent v1.0.0          ║');
+console.log(`  ║       IndieClaw Agent v${VERSION.padEnd(16)}║`);
 console.log('  ╠═══════════════════════════════════════╣');
-console.log(`  ║  Port:  ${PORT}                          ║`);
+console.log(`  ║  Port:  ${String(PORT).padEnd(30)}║`);
 console.log(`  ║  Token: ${AUTH_TOKEN.substring(0, 12)}...              ║`);
+console.log(`  ║  TLS:   ${TLS_ENABLED ? 'Enabled ' : 'Disabled'}                      ║`);
 console.log('  ╚═══════════════════════════════════════╝');
 console.log('');
 console.log(`  Full token: ${AUTH_TOKEN}`);
 console.log('  Enter this token in the IndieClaw mobile app to connect.');
 console.log('');
+console.log(`  Deep link: ${deepLink}`);
+console.log('');
+
+// Try to show QR code (optional dependency)
+try {
+  const qrcode = require('qrcode-terminal');
+  qrcode.generate(deepLink, { small: true }, (qr) => {
+    console.log('  Scan this QR code with your phone:');
+    console.log('');
+    qr.split('\n').forEach((line) => console.log('  ' + line));
+    console.log('');
+  });
+} catch {
+  // qrcode-terminal not installed, skip QR display
+}
+
+// --- OpenClaw Detection ---
+const OPENCLAW_PORTS = [18789, 8080, 11434, 1234, 8000];
+
+function tryOpenClawPort(port) {
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/models',
+        method: 'GET',
+        timeout: 2000,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk) => (body += chunk));
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(body);
+            const models = (json.data || []).map((m) => m.id);
+            if (models.length > 0) {
+              resolve({ available: true, models, port });
+            } else {
+              resolve({ available: false, models: [], port });
+            }
+          } catch {
+            resolve({ available: false, models: [], port });
+          }
+        });
+      }
+    );
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ available: false, models: [], port });
+    });
+    req.on('error', () => {
+      resolve({ available: false, models: [], port });
+    });
+    req.end();
+  });
+}
+
+async function detectOpenClaw() {
+  // Try all common ports in parallel
+  const results = await Promise.all(OPENCLAW_PORTS.map(tryOpenClawPort));
+  const found = results.find((r) => r.available);
+  if (found) {
+    return { available: true, models: found.models, port: found.port };
+  }
+  return { available: false, models: [], port: null };
+}
+
+// Run detection on startup
+detectOpenClaw().then((oc) => {
+  if (oc.available) {
+    console.log(`  [OpenClaw] Detected on port ${oc.port}! Models: ${oc.models.join(', ')}`);
+  } else {
+    console.log(`  [OpenClaw] Not detected on ports ${OPENCLAW_PORTS.join(', ')}`);
+  }
+});
+
+// --- Push Notification Helpers ---
+function loadPushTokens() {
+  try {
+    return JSON.parse(fs.readFileSync(PUSH_TOKENS_FILE, 'utf-8'));
+  } catch {
+    return [];
+  }
+}
+
+function savePushTokens(tokens) {
+  if (!fs.existsSync(INDIECLAW_DIR)) {
+    fs.mkdirSync(INDIECLAW_DIR, { recursive: true, mode: 0o700 });
+  }
+  fs.writeFileSync(PUSH_TOKENS_FILE, JSON.stringify(tokens), 'utf-8');
+}
+
+function sendPushNotification(title, body, data = {}) {
+  const tokens = loadPushTokens();
+  if (!tokens.length) return;
+  const payload = JSON.stringify(tokens.map(to => ({ to, title, body, data, sound: 'default' })));
+  const req = https.request(EXPO_PUSH_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+  req.on('error', () => {});
+  req.write(payload);
+  req.end();
+}
 
 wss.on('connection', (ws) => {
   let authenticated = false;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -64,7 +244,8 @@ wss.on('connection', (ws) => {
     if (!authenticated) {
       if (msg.type === 'auth' && msg.token === AUTH_TOKEN) {
         authenticated = true;
-        return ws.send(JSON.stringify({ type: 'auth', success: true }));
+        const openclaw = await detectOpenClaw();
+        return ws.send(JSON.stringify({ type: 'auth', success: true, openclaw }));
       }
       if (msg.type === 'ping') {
         return ws.send(JSON.stringify({ type: 'pong' }));
@@ -162,6 +343,20 @@ async function handleMessage(ws, msg) {
         return handleChatSend(ws, msg);
       case 'chat.stop':
         return handleChatStop(ws, msg);
+      case 'push.register':
+        return handlePushRegister(ws, msg);
+      case 'push.unregister':
+        return handlePushUnregister(ws, msg);
+      case 'logs.system':
+        return handleLogsSystem(ws, msg);
+      case 'logs.search':
+        return handleLogsSearch(ws, msg);
+      case 'cron.history':
+        return handleCronHistory(ws, msg);
+      case 'agent.list':
+        return handleAgentList(ws, msg);
+      case 'agent.logs':
+        return handleAgentLogs(ws, msg);
       default:
         return replyError(ws, id, `Unknown message type: ${type}`);
     }
@@ -861,12 +1056,214 @@ function handleChatStop(ws, { id, chatId }) {
   reply(ws, id, { stopped: true });
 }
 
+// --- Push Registration ---
+function handlePushRegister(ws, { id, pushToken }) {
+  const tokens = loadPushTokens();
+  if (!tokens.includes(pushToken)) {
+    tokens.push(pushToken);
+    savePushTokens(tokens);
+  }
+  reply(ws, id, { registered: true });
+}
+
+function handlePushUnregister(ws, { id, pushToken }) {
+  let tokens = loadPushTokens();
+  tokens = tokens.filter((t) => t !== pushToken);
+  savePushTokens(tokens);
+  reply(ws, id, { unregistered: true });
+}
+
+// --- System Logs ---
+function handleLogsSystem(ws, { id, lines = 200 }) {
+  const platform = os.platform();
+
+  if (platform === 'linux') {
+    exec(`journalctl -n ${lines} --no-pager -o json`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
+      if (err) return replyError(ws, id, err.message);
+      try {
+        const entries = stdout.trim().split('\n').filter(Boolean).map((line) => {
+          const j = JSON.parse(line);
+          return {
+            timestamp: j.__REALTIME_TIMESTAMP ? new Date(parseInt(j.__REALTIME_TIMESTAMP, 10) / 1000).toISOString() : null,
+            level: j.PRIORITY || 'info',
+            message: j.MESSAGE || '',
+            source: j.SYSLOG_IDENTIFIER || j._COMM || '',
+          };
+        });
+        reply(ws, id, entries);
+      } catch (e) {
+        replyError(ws, id, 'Failed to parse journal entries: ' + e.message);
+      }
+    });
+  } else {
+    // macOS
+    exec(`log show --last 1h --style json | head -${lines}`, { timeout: 15000, maxBuffer: 1024 * 1024 * 10 }, (err, stdout) => {
+      if (err) {
+        // Fallback: try system.log
+        return exec(`tail -${lines} /var/log/system.log`, { timeout: 5000 }, (err2, stdout2) => {
+          if (err2) return replyError(ws, id, err2.message);
+          const entries = stdout2.trim().split('\n').filter(Boolean).map((line) => ({
+            timestamp: null,
+            level: 'info',
+            message: line,
+            source: '',
+          }));
+          reply(ws, id, entries);
+        });
+      }
+      try {
+        const entries = stdout.trim().split('\n').filter(Boolean).map((line) => {
+          try {
+            const j = JSON.parse(line);
+            return {
+              timestamp: j.timestamp || null,
+              level: j.messageType || 'info',
+              message: j.eventMessage || '',
+              source: j.senderImagePath || j.processImagePath || '',
+            };
+          } catch {
+            return { timestamp: null, level: 'info', message: line, source: '' };
+          }
+        });
+        reply(ws, id, entries);
+      } catch (e) {
+        replyError(ws, id, 'Failed to parse log entries: ' + e.message);
+      }
+    });
+  }
+}
+
+// --- Log Search ---
+function handleLogsSearch(ws, { id, query, lines = 100 }) {
+  const platform = os.platform();
+  // Sanitize query to prevent command injection
+  const safeQuery = query.replace(/["`$\\]/g, '');
+
+  if (platform === 'linux') {
+    exec(`journalctl -n ${lines} --no-pager -g "${safeQuery}"`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
+      if (err) return replyError(ws, id, err.message);
+      const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
+        timestamp: null,
+        level: 'info',
+        message: line,
+        source: '',
+      }));
+      reply(ws, id, entries);
+    });
+  } else {
+    // macOS
+    exec(`grep -i "${safeQuery}" /var/log/system.log | tail -${lines}`, { timeout: 10000 }, (err, stdout) => {
+      if (err) return replyError(ws, id, err.message || 'No matches found');
+      const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
+        timestamp: null,
+        level: 'info',
+        message: line,
+        source: '',
+      }));
+      reply(ws, id, entries);
+    });
+  }
+}
+
+// --- Cron History ---
+function handleCronHistory(ws, { id }) {
+  const platform = os.platform();
+
+  if (platform === 'linux') {
+    exec('journalctl -u cron -n 50 --no-pager -o json', { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
+      if (err) return replyError(ws, id, err.message);
+      try {
+        const entries = stdout.trim().split('\n').filter(Boolean).map((line) => {
+          const j = JSON.parse(line);
+          return {
+            timestamp: j.__REALTIME_TIMESTAMP ? new Date(parseInt(j.__REALTIME_TIMESTAMP, 10) / 1000).toISOString() : null,
+            command: j.MESSAGE || '',
+            exitCode: null,
+            output: j.MESSAGE || '',
+          };
+        });
+        reply(ws, id, entries);
+      } catch (e) {
+        replyError(ws, id, 'Failed to parse cron history: ' + e.message);
+      }
+    });
+  } else {
+    // macOS
+    exec('grep CRON /var/log/system.log | tail -50', { timeout: 5000 }, (err, stdout) => {
+      if (err) {
+        // No cron entries or file not accessible
+        return reply(ws, id, []);
+      }
+      const entries = stdout.trim().split('\n').filter(Boolean).map((line) => ({
+        timestamp: null,
+        command: line,
+        exitCode: null,
+        output: line,
+      }));
+      reply(ws, id, entries);
+    });
+  }
+}
+
+// --- Agent List (OpenClaw Models) ---
+async function handleAgentList(ws, { id }) {
+  const oc = await detectOpenClaw();
+  if (oc.available) {
+    const models = oc.models.map((modelId) => ({
+      id: modelId,
+      name: modelId,
+      status: 'running',
+      port: oc.port,
+    }));
+    return reply(ws, id, models);
+  }
+  reply(ws, id, []);
+}
+
+// --- Agent Logs ---
+function handleAgentLogs(ws, { id, lines = 200 }) {
+  const platform = os.platform();
+
+  if (platform === 'linux') {
+    exec(`journalctl -u openclaw -n ${lines} --no-pager`, { timeout: 10000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout) => {
+      if (err) return replyError(ws, id, err.message);
+      reply(ws, id, { logs: stdout || '' });
+    });
+  } else {
+    // macOS / fallback: try common log locations
+    const logLocations = [
+      path.join(os.homedir(), '.openclaw', 'logs', 'openclaw.log'),
+      path.join(os.homedir(), '.openclaw', 'openclaw.log'),
+      '/var/log/openclaw.log',
+    ];
+
+    let found = false;
+    for (const logPath of logLocations) {
+      try {
+        if (fs.existsSync(logPath)) {
+          exec(`tail -${lines} "${logPath}"`, { timeout: 5000 }, (err, stdout) => {
+            if (err) return reply(ws, id, { logs: '' });
+            reply(ws, id, { logs: stdout || '' });
+          });
+          found = true;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!found) {
+      reply(ws, id, { logs: '' });
+    }
+  }
+}
+
 // --- Graceful Shutdown ---
 process.on('SIGINT', () => {
   console.log('\n[agent] Shutting down...');
   for (const [, term] of terminals) term.kill();
   for (const [, req] of activeChats) req.destroy();
   wss.close();
+  if (server) server.close();
   process.exit(0);
 });
 
@@ -874,5 +1271,6 @@ process.on('SIGTERM', () => {
   for (const [, term] of terminals) term.kill();
   for (const [, req] of activeChats) req.destroy();
   wss.close();
+  if (server) server.close();
   process.exit(0);
 });

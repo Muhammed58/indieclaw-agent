@@ -23,7 +23,7 @@ else
 fi
 
 # Step 1: Check/Install Node.js
-echo -e "${YELLOW}[1/4]${NC} Checking Node.js..."
+echo -e "${YELLOW}[1/5]${NC} Checking Node.js..."
 if command -v node &> /dev/null; then
   NODE_VERSION=$(node -v)
   echo -e "  ${GREEN}✓${NC} Node.js ${NODE_VERSION} found"
@@ -46,12 +46,13 @@ else
 fi
 
 # Step 2: Install indieclaw-agent
-echo -e "${YELLOW}[2/4]${NC} Installing indieclaw-agent..."
-$SUDO npm install -g indieclaw-agent 2>/dev/null || npm install -g indieclaw-agent
-echo -e "  ${GREEN}✓${NC} indieclaw-agent installed"
+echo -e "${YELLOW}[2/5]${NC} Installing indieclaw-agent..."
+$SUDO npm install -g indieclaw-agent@latest 2>/dev/null || npm install -g indieclaw-agent@latest
+AGENT_VERSION=$(node -e "try{console.log(require(require('child_process').execSync('which indieclaw-agent',{encoding:'utf8'}).trim().replace(/indieclaw-agent$/,'')+'../lib/node_modules/indieclaw-agent/package.json').version)}catch{console.log('2.0.0')}" 2>/dev/null || echo "2.0.0")
+echo -e "  ${GREEN}✓${NC} indieclaw-agent v${AGENT_VERSION} installed"
 
 # Step 3: Create systemd service
-echo -e "${YELLOW}[3/4]${NC} Setting up background service..."
+echo -e "${YELLOW}[3/5]${NC} Setting up background service..."
 AGENT_PATH=$(which indieclaw-agent)
 CURRENT_USER=$(whoami)
 
@@ -74,32 +75,72 @@ EOF
 
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable indieclaw-agent
-$SUDO systemctl start indieclaw-agent
+$SUDO systemctl restart indieclaw-agent
 echo -e "  ${GREEN}✓${NC} Service created and started"
 
-# Step 4: Wait for token to be generated
+# Step 4: Wait for token and detect IP
+echo -e "${YELLOW}[4/5]${NC} Detecting configuration..."
 sleep 2
 
-# Show token
-echo ""
-echo -e "${CYAN}═══════════════════════════════════════${NC}"
-echo ""
+PORT=3100
+HOSTNAME=$(hostname)
 
+# Get token
 if [ -f "$HOME/.indieclaw-token" ]; then
   TOKEN=$(cat "$HOME/.indieclaw-token")
-  echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
-  echo ""
-  echo -e "  Your auth token:"
-  echo ""
-  echo -e "  ${BOLD}${CYAN}${TOKEN}${NC}"
-  echo ""
-  echo -e "  Copy this token into the IndieClaw app."
-  echo -e "  Port: ${BOLD}3100${NC}"
 else
-  echo -e "  ${GREEN}${BOLD}Setup complete!${NC}"
+  echo -e "  ${YELLOW}⚠${NC} Token file not found yet. Check: cat ~/.indieclaw-token"
+  TOKEN=""
+fi
+
+# Detect IP (same logic as agent: try tailscale first, fallback to network)
+MACHINE_IP=""
+if command -v tailscale &> /dev/null; then
+  MACHINE_IP=$(tailscale ip -4 2>/dev/null || true)
+fi
+if [ -z "$MACHINE_IP" ]; then
+  MACHINE_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || ip route get 1 2>/dev/null | awk '{print $7; exit}' || echo "")
+fi
+if [ -z "$MACHINE_IP" ]; then
+  MACHINE_IP="YOUR_SERVER_IP"
+fi
+
+echo -e "  ${GREEN}✓${NC} IP: ${MACHINE_IP}"
+
+# Step 5: Check OpenClaw
+echo -e "${YELLOW}[5/5]${NC} Checking OpenClaw..."
+OPENCLAW_STATUS="not detected"
+if curl -s --max-time 2 http://127.0.0.1:18789/v1/models > /dev/null 2>&1; then
+  OPENCLAW_STATUS="detected on port 18789"
+  echo -e "  ${GREEN}✓${NC} OpenClaw detected on port 18789"
+else
+  echo -e "  ${YELLOW}—${NC} OpenClaw not detected on port 18789 (optional, for AI features)"
+fi
+
+# Build deep link
+DEEP_LINK="indieclaw://connect?host=${MACHINE_IP}&port=${PORT}&token=${TOKEN}&name=${HOSTNAME}&tls=0"
+
+# Show results
+echo ""
+echo -e "${CYAN}╔═══════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║       ${BOLD}IndieClaw Agent v${AGENT_VERSION}${NC}${CYAN}          ║${NC}"
+echo -e "${CYAN}╠═══════════════════════════════════════╣${NC}"
+echo -e "${CYAN}║${NC}  Port:     ${BOLD}${PORT}${NC}"
+echo -e "${CYAN}║${NC}  IP:       ${BOLD}${MACHINE_IP}${NC}"
+echo -e "${CYAN}║${NC}  OpenClaw: ${BOLD}${OPENCLAW_STATUS}${NC}"
+echo -e "${CYAN}╚═══════════════════════════════════════╝${NC}"
+echo ""
+
+if [ -n "$TOKEN" ]; then
+  echo -e "  ${BOLD}Auth Token:${NC}"
+  echo -e "  ${CYAN}${TOKEN}${NC}"
   echo ""
-  echo -e "  Run this to see your token:"
-  echo -e "  ${BOLD}cat ~/.indieclaw-token${NC}"
+  echo -e "  ${BOLD}Deep Link (paste in phone browser):${NC}"
+  echo -e "  ${CYAN}${DEEP_LINK}${NC}"
+  echo ""
+  echo -e "  ${BOLD}Or scan QR code:${NC}"
+  echo -e "  Run: ${BOLD}indieclaw-agent${NC} interactively to see QR code"
+  echo -e "  Or:  ${BOLD}sudo journalctl -u indieclaw-agent --no-pager | head -50${NC}"
 fi
 
 echo ""
