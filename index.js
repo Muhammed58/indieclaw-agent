@@ -1204,7 +1204,7 @@ async function handleChatSend(ws, { id, messages }) {
     // Send chat request to gateway via WebSocket protocol
     const result = await ocRequest('chat.send', {
       sessionKey,
-      message: { role: 'user', content: lastUserMsg.content },
+      message: lastUserMsg.content,
       idempotencyKey,
     });
 
