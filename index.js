@@ -146,28 +146,85 @@ try {
 }
 
 // --- OpenClaw Detection, Config & Gateway Client ---
-const OPENCLAW_CONFIG_PATHS = [
-  path.join(os.homedir(), '.openclaw', 'openclaw.json'),
-  path.join(os.homedir(), '.openclaw', 'openclaw.json5'),
-];
+
+// Search multiple possible config locations (systemd may resolve homedir differently)
+function getConfigPaths() {
+  const paths = [];
+  const home = os.homedir();
+  paths.push(path.join(home, '.openclaw', 'openclaw.json'));
+  paths.push(path.join(home, '.openclaw', 'openclaw.json5'));
+  // Also check /root explicitly (systemd services may not resolve ~ to /root)
+  if (home !== '/root') {
+    paths.push('/root/.openclaw/openclaw.json');
+    paths.push('/root/.openclaw/openclaw.json5');
+  }
+  return paths;
+}
+
+const OPENCLAW_CONFIG_PATHS = getConfigPaths();
+
+function stripJsonComments(raw) {
+  // Remove comments WITHOUT corrupting URLs inside strings
+  // Walk char-by-char, track if we're inside a string
+  let result = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      result += ch;
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '"') { inString = false; }
+      continue;
+    }
+    // Not in string
+    if (ch === '"') { inString = true; result += ch; continue; }
+    // Line comment
+    if (ch === '/' && raw[i + 1] === '/') {
+      // Skip to end of line
+      while (i < raw.length && raw[i] !== '\n') i++;
+      result += '\n';
+      continue;
+    }
+    // Block comment
+    if (ch === '/' && raw[i + 1] === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
+      i++; // skip closing /
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
 
 function readOpenClawConfig() {
   for (const cfgPath of OPENCLAW_CONFIG_PATHS) {
     try {
-      if (!fs.existsSync(cfgPath)) continue;
+      const exists = fs.existsSync(cfgPath);
+      console.log(`  [OpenClaw] Config ${cfgPath}: ${exists ? 'EXISTS' : 'not found'}`);
+      if (!exists) continue;
       let raw = fs.readFileSync(cfgPath, 'utf-8');
-      raw = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+      // Strip comments safely (preserves URLs in strings)
+      raw = stripJsonComments(raw);
+      // Remove trailing commas
       raw = raw.replace(/,\s*([\]}])/g, '$1');
       const config = JSON.parse(raw);
       const gw = config.gateway || {};
-      return {
+      const result = {
         port: gw.port || 18789,
         token: gw.auth?.token || gw.auth?.password || null,
         host: gw.bind || '127.0.0.1',
       };
-    } catch {}
+      console.log(`  [OpenClaw] Config parsed: port=${result.port}, host=${result.host}, token=${result.token ? 'SET' : 'NONE'}`);
+      return result;
+    } catch (err) {
+      console.log(`  [OpenClaw] Config parse error for ${cfgPath}: ${err.message}`);
+    }
   }
   // Fallback: check env var
+  console.log('  [OpenClaw] No config file found, using defaults (port 18789)');
   return {
     port: parseInt(process.env.OPENCLAW_GATEWAY_PORT || '18789', 10),
     token: process.env.OPENCLAW_GATEWAY_TOKEN || null,
@@ -180,26 +237,43 @@ let openClawConfig = readOpenClawConfig();
 // TCP port check — fast and reliable, no auth needed
 function isPortListening(port, host = '127.0.0.1') {
   return new Promise((resolve) => {
+    console.log(`  [OpenClaw] TCP probe ${host}:${port}...`);
     const sock = net.createConnection({ port, host }, () => {
+      console.log(`  [OpenClaw] TCP probe ${host}:${port} → OPEN`);
       sock.destroy();
       resolve(true);
     });
-    sock.on('error', () => resolve(false));
-    sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+    sock.on('error', (err) => {
+      console.log(`  [OpenClaw] TCP probe ${host}:${port} → ERROR: ${err.message}`);
+      resolve(false);
+    });
+    sock.setTimeout(2000, () => {
+      console.log(`  [OpenClaw] TCP probe ${host}:${port} → TIMEOUT`);
+      sock.destroy();
+      resolve(false);
+    });
   });
 }
 
 async function detectOpenClaw() {
+  console.log('  [OpenClaw] Running detection...');
   openClawConfig = readOpenClawConfig();
-  const listening = await isPortListening(openClawConfig.port);
+
+  // Always probe 127.0.0.1 — the gateway listens on loopback
+  const port = openClawConfig.port || 18789;
+  const listening = await isPortListening(port, '127.0.0.1');
   if (listening) {
-    return { available: true, models: ['openclaw'], port: openClawConfig.port };
+    console.log(`  [OpenClaw] Detection result: AVAILABLE (port ${port})`);
+    return { available: true, models: ['openclaw'], port };
   }
+
   // Fallback: check if config file exists (installed but not running)
   const installed = OPENCLAW_CONFIG_PATHS.some((p) => fs.existsSync(p));
   if (installed) {
-    return { available: false, models: [], port: openClawConfig.port, installed: true };
+    console.log(`  [OpenClaw] Detection result: INSTALLED but gateway not running`);
+    return { available: false, models: [], port, installed: true };
   }
+  console.log('  [OpenClaw] Detection result: NOT FOUND');
   return { available: false, models: [], port: null };
 }
 
@@ -213,6 +287,7 @@ function connectOcGateway() {
   return new Promise((resolve, reject) => {
     openClawConfig = readOpenClawConfig();
     const url = `ws://127.0.0.1:${openClawConfig.port}`;
+    console.log(`  [OpenClaw] Connecting to gateway: ${url}`);
 
     if (ocGateway) { try { ocGateway.close(); } catch {} }
     ocGateway = null;
@@ -220,11 +295,13 @@ function connectOcGateway() {
 
     const ws = new WebSocket(url);
     let connectReqId = null;
-    const timeout = setTimeout(() => { ws.close(); reject(new Error('Gateway timeout')); }, 10000);
+    const timeout = setTimeout(() => { console.log('  [OpenClaw] Gateway connection TIMEOUT'); ws.close(); reject(new Error('Gateway timeout')); }, 10000);
 
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
+
+      console.log(`  [OpenClaw] Gateway msg: type=${msg.type}, event=${msg.event || ''}, id=${msg.id || ''}, ok=${msg.ok}`);
 
       // Step 1: Gateway sends connect.challenge
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
@@ -292,8 +369,9 @@ function connectOcGateway() {
       }
     });
 
-    ws.on('error', (err) => { clearTimeout(timeout); ocReady = false; reject(err); });
+    ws.on('error', (err) => { console.log(`  [OpenClaw] Gateway error: ${err.message}`); clearTimeout(timeout); ocReady = false; reject(err); });
     ws.on('close', () => {
+      console.log('  [OpenClaw] Gateway connection closed');
       ocReady = false;
       ocGateway = null;
       // Notify all pending chat streams that gateway disconnected
@@ -383,6 +461,7 @@ wss.on('connection', (ws) => {
       if (msg.type === 'auth' && msg.token === AUTH_TOKEN) {
         authenticated = true;
         const openclaw = await detectOpenClaw();
+        console.log(`  [Auth] Sending auth success, openclaw:`, JSON.stringify(openclaw));
         return ws.send(JSON.stringify({ type: 'auth', success: true, openclaw }));
       }
       if (msg.type === 'ping') {
@@ -1105,14 +1184,18 @@ function handleTerminalStop(ws, { id }) {
 // --- Chat (OpenClaw Gateway Proxy) ---
 async function handleChatSend(ws, { id, messages }) {
   try {
+    console.log(`  [Chat] handleChatSend id=${id}, messages=${messages.length}`);
+
     // Connect to OpenClaw gateway (auto-reconnects if needed)
     await getOcGateway();
+    console.log('  [Chat] Gateway connected');
 
     // Extract the last user message from the conversation
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
     if (!lastUserMsg) {
       return send(ws, { type: 'chat.done', id, error: 'No user message found' });
     }
+    console.log(`  [Chat] Sending to OpenClaw: "${lastUserMsg.content.substring(0, 80)}..."`);
 
     // Build a session key — unique per chat conversation
     const sessionKey = `agent:indieclaw:mobile:${id}`;
@@ -1125,12 +1208,16 @@ async function handleChatSend(ws, { id, messages }) {
       idempotencyKey,
     });
 
+    console.log(`  [Chat] ocRequest result:`, JSON.stringify(result).substring(0, 200));
+
     // Register for streaming events using the runId from the response
     const runId = result?.runId || result?.id || id;
+    console.log(`  [Chat] Registered callback for runId=${runId}`);
     ocChatCallbacks.set(runId, { ws, chatId: id });
     activeChats.set(id, { runId, _ws: ws });
 
   } catch (err) {
+    console.log(`  [Chat] ERROR: ${err.message}`);
     send(ws, { type: 'chat.done', id, error: `OpenClaw: ${err.message}` });
   }
 }
