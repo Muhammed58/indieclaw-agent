@@ -277,6 +277,34 @@ async function detectOpenClaw() {
   return { available: false, models: [], port: null };
 }
 
+// Extract text from OpenClaw chat event payload (handles all known shapes)
+function extractChatText(p) {
+  // Direct string fields
+  if (typeof p.delta === 'string') return p.delta;
+  if (typeof p.text === 'string') return p.text;
+  if (typeof p.content === 'string') return p.content;
+  if (typeof p.message === 'string') return p.message;
+  // Nested in message object
+  if (p.message && typeof p.message === 'object') {
+    if (typeof p.message.content === 'string') return p.message.content;
+    if (typeof p.message.text === 'string') return p.message.text;
+    if (typeof p.message.delta === 'string') return p.message.delta;
+    // Content array (e.g. [{ type: 'text', text: '...' }])
+    if (Array.isArray(p.message.content)) {
+      return p.message.content
+        .filter(c => c.type === 'text' && c.text)
+        .map(c => c.text)
+        .join('');
+    }
+  }
+  // Nested in delta object
+  if (p.delta && typeof p.delta === 'object') {
+    if (typeof p.delta.content === 'string') return p.delta.content;
+    if (typeof p.delta.text === 'string') return p.delta.text;
+  }
+  return '';
+}
+
 // --- OpenClaw Gateway WebSocket Client ---
 let ocGateway = null;
 let ocReady = false;
@@ -348,19 +376,21 @@ function connectOcGateway() {
         const cb = ocChatCallbacks.get(p.runId);
         if (!cb) return;
 
-        if (p.state === 'delta') {
-          // Extract text from delta — try common field paths
-          const text = typeof p.message === 'string' ? p.message
-            : p.message?.content || p.message?.text || '';
+        // Log first few events to debug payload structure
+        if (!cb._logged) {
+          console.log(`  [Chat] Event payload sample:`, JSON.stringify(p).substring(0, 500));
+          cb._logged = true;
+        }
+
+        if (p.state === 'delta' || p.state === 'final') {
+          const text = extractChatText(p);
           if (text) send(cb.ws, { type: 'chat.stream', id: cb.chatId, content: text });
-        } else if (p.state === 'final') {
-          const text = typeof p.message === 'string' ? p.message
-            : p.message?.content || p.message?.text || '';
-          if (text) send(cb.ws, { type: 'chat.stream', id: cb.chatId, content: text });
-          send(cb.ws, { type: 'chat.done', id: cb.chatId });
-          ocChatCallbacks.delete(p.runId);
+          if (p.state === 'final') {
+            send(cb.ws, { type: 'chat.done', id: cb.chatId });
+            ocChatCallbacks.delete(p.runId);
+          }
         } else if (p.state === 'error') {
-          send(cb.ws, { type: 'chat.done', id: cb.chatId, error: p.errorMessage || 'OpenClaw error' });
+          send(cb.ws, { type: 'chat.done', id: cb.chatId, error: p.errorMessage || p.error || 'OpenClaw error' });
           ocChatCallbacks.delete(p.runId);
         } else if (p.state === 'aborted') {
           send(cb.ws, { type: 'chat.done', id: cb.chatId });

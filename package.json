@@ -1,6 +1,6 @@
 {
   "name": "indieclaw-agent",
-  "version": "2.4.4",
+  "version": "2.4.5",
   "description": "Manage your server from your phone. Agent for the IndieClaw mobile app.",
   "main": "index.js",
   "bin": {
