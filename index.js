@@ -308,7 +308,7 @@ function connectOcGateway() {
         connectReqId = crypto.randomUUID();
         const params = {
           minProtocol: 3, maxProtocol: 3,
-          client: { id: 'indieclaw-agent', version: VERSION, platform: os.platform(), mode: 'operator' },
+          client: { id: 'cli', version: VERSION, platform: os.platform(), mode: 'cli' },
           role: 'operator',
           scopes: ['operator.read', 'operator.write'],
         };
