@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 const { execSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -8,6 +9,7 @@ const os = require('os');
 const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 
 // --- Version from package.json ---
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
@@ -89,7 +91,7 @@ if (TLS_ENABLED) {
 }
 
 const terminals = new Map(); // id -> pty process
-const activeChats = new Map(); // id -> http.ClientRequest
+const activeChats = new Map(); // chatId -> { runId, _ws }
 const activeSearches = new Map(); // ws -> child_process (one search per connection)
 
 // --- Deep Link & QR Code ---
@@ -143,21 +145,18 @@ try {
   // qrcode-terminal not installed, skip QR display
 }
 
-// --- OpenClaw Detection & Config ---
+// --- OpenClaw Detection, Config & Gateway Client ---
 const OPENCLAW_CONFIG_PATHS = [
   path.join(os.homedir(), '.openclaw', 'openclaw.json'),
   path.join(os.homedir(), '.openclaw', 'openclaw.json5'),
 ];
 
-// Read OpenClaw gateway config (port + auth token) from local config file
 function readOpenClawConfig() {
-  for (const configPath of OPENCLAW_CONFIG_PATHS) {
+  for (const cfgPath of OPENCLAW_CONFIG_PATHS) {
     try {
-      if (!fs.existsSync(configPath)) continue;
-      let raw = fs.readFileSync(configPath, 'utf-8');
-      // Strip JSON5 comments (// and /* */) for safe JSON.parse
+      if (!fs.existsSync(cfgPath)) continue;
+      let raw = fs.readFileSync(cfgPath, 'utf-8');
       raw = raw.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-      // Strip trailing commas before } or ]
       raw = raw.replace(/,\s*([\]}])/g, '$1');
       const config = JSON.parse(raw);
       const gw = config.gateway || {};
@@ -168,45 +167,164 @@ function readOpenClawConfig() {
       };
     } catch {}
   }
-  return { port: 18789, token: null, host: '127.0.0.1' };
+  // Fallback: check env var
+  return {
+    port: parseInt(process.env.OPENCLAW_GATEWAY_PORT || '18789', 10),
+    token: process.env.OPENCLAW_GATEWAY_TOKEN || null,
+    host: '127.0.0.1',
+  };
 }
 
-// Cache the config on startup
 let openClawConfig = readOpenClawConfig();
 
-function detectOpenClaw() {
+// TCP port check — fast and reliable, no auth needed
+function isPortListening(port, host = '127.0.0.1') {
   return new Promise((resolve) => {
-    // Refresh config each detection
-    openClawConfig = readOpenClawConfig();
+    const sock = net.createConnection({ port, host }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on('error', () => resolve(false));
+    sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+  });
+}
 
-    // Method 1: Use `openclaw gateway status` CLI (most reliable)
-    exec('openclaw gateway status 2>&1', { timeout: 5000 }, (err, stdout) => {
-      const output = (stdout || '').toLowerCase();
-      if (!err && (output.includes('running') || output.includes('active'))) {
-        return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
+async function detectOpenClaw() {
+  openClawConfig = readOpenClawConfig();
+  const listening = await isPortListening(openClawConfig.port);
+  if (listening) {
+    return { available: true, models: ['openclaw'], port: openClawConfig.port };
+  }
+  // Fallback: check if config file exists (installed but not running)
+  const installed = OPENCLAW_CONFIG_PATHS.some((p) => fs.existsSync(p));
+  if (installed) {
+    return { available: false, models: [], port: openClawConfig.port, installed: true };
+  }
+  return { available: false, models: [], port: null };
+}
+
+// --- OpenClaw Gateway WebSocket Client ---
+let ocGateway = null;
+let ocReady = false;
+const ocPending = new Map();
+const ocChatCallbacks = new Map(); // runId -> { ws, chatId }
+
+function connectOcGateway() {
+  return new Promise((resolve, reject) => {
+    openClawConfig = readOpenClawConfig();
+    const url = `ws://127.0.0.1:${openClawConfig.port}`;
+
+    if (ocGateway) { try { ocGateway.close(); } catch {} }
+    ocGateway = null;
+    ocReady = false;
+
+    const ws = new WebSocket(url);
+    let connectReqId = null;
+    const timeout = setTimeout(() => { ws.close(); reject(new Error('Gateway timeout')); }, 10000);
+
+    ws.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+
+      // Step 1: Gateway sends connect.challenge
+      if (msg.type === 'event' && msg.event === 'connect.challenge') {
+        connectReqId = crypto.randomUUID();
+        const params = {
+          minProtocol: 3, maxProtocol: 3,
+          client: { id: 'indieclaw-agent', version: VERSION, platform: os.platform(), mode: 'operator' },
+          role: 'operator',
+          scopes: ['operator.read', 'operator.write'],
+        };
+        if (openClawConfig.token) params.auth = { token: openClawConfig.token };
+        ws.send(JSON.stringify({ type: 'req', id: connectReqId, method: 'connect', params }));
+        return;
       }
 
-      // Method 2: Check if openclaw-gateway process is running
-      exec('pgrep -f "openclaw.gateway\\|openclaw-gateway" 2>/dev/null', { timeout: 2000 }, (err3, pid) => {
-        if (!err3 && pid?.trim()) {
-          return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
+      // Step 2: Handle hello-ok response
+      if (msg.type === 'res' && msg.id === connectReqId) {
+        clearTimeout(timeout);
+        if (msg.ok) {
+          ocGateway = ws;
+          ocReady = true;
+          resolve(ws);
+        } else {
+          ws.close();
+          reject(new Error(msg.error?.message || 'Gateway auth failed'));
         }
+        return;
+      }
 
-        // Method 3: Check if openclaw binary exists + health check
-        exec('command -v openclaw 2>/dev/null', { timeout: 2000 }, (err2, binPath) => {
-          if (err2 || !binPath?.trim()) {
-            return resolve({ available: false, models: [], port: null });
-          }
-          exec(`openclaw gateway health --url ws://127.0.0.1:${openClawConfig.port} 2>&1`, { timeout: 5000 }, (err4, healthOut) => {
-            const hOutput = (healthOut || '').toLowerCase();
-            if (!err4 && (hOutput.includes('ok') || hOutput.includes('healthy') || hOutput.includes('reachable'))) {
-              return resolve({ available: true, models: ['openclaw'], port: openClawConfig.port });
-            }
-            return resolve({ available: false, models: [], port: null });
-          });
-        });
-      });
+      // Handle other req/res
+      if (msg.type === 'res' && msg.id) {
+        const pending = ocPending.get(msg.id);
+        if (pending) {
+          ocPending.delete(msg.id);
+          clearTimeout(pending.timeout);
+          if (msg.ok) pending.resolve(msg.payload);
+          else pending.reject(new Error(msg.error?.message || 'Request failed'));
+        }
+      }
+
+      // Handle chat streaming events
+      if (msg.type === 'event' && msg.event === 'chat') {
+        const p = msg.payload;
+        const cb = ocChatCallbacks.get(p.runId);
+        if (!cb) return;
+
+        if (p.state === 'delta') {
+          // Extract text from delta — try common field paths
+          const text = typeof p.message === 'string' ? p.message
+            : p.message?.content || p.message?.text || '';
+          if (text) send(cb.ws, { type: 'chat.stream', id: cb.chatId, content: text });
+        } else if (p.state === 'final') {
+          const text = typeof p.message === 'string' ? p.message
+            : p.message?.content || p.message?.text || '';
+          if (text) send(cb.ws, { type: 'chat.stream', id: cb.chatId, content: text });
+          send(cb.ws, { type: 'chat.done', id: cb.chatId });
+          ocChatCallbacks.delete(p.runId);
+        } else if (p.state === 'error') {
+          send(cb.ws, { type: 'chat.done', id: cb.chatId, error: p.errorMessage || 'OpenClaw error' });
+          ocChatCallbacks.delete(p.runId);
+        } else if (p.state === 'aborted') {
+          send(cb.ws, { type: 'chat.done', id: cb.chatId });
+          ocChatCallbacks.delete(p.runId);
+        }
+      }
     });
+
+    ws.on('error', (err) => { clearTimeout(timeout); ocReady = false; reject(err); });
+    ws.on('close', () => {
+      ocReady = false;
+      ocGateway = null;
+      // Notify all pending chat streams that gateway disconnected
+      for (const [runId, cb] of ocChatCallbacks) {
+        send(cb.ws, { type: 'chat.done', id: cb.chatId, error: 'OpenClaw gateway disconnected' });
+        ocChatCallbacks.delete(runId);
+      }
+      // Reject all pending requests
+      for (const [id, p] of ocPending) {
+        clearTimeout(p.timeout);
+        p.reject(new Error('Gateway disconnected'));
+        ocPending.delete(id);
+      }
+    });
+  });
+}
+
+async function getOcGateway() {
+  if (ocGateway && ocGateway.readyState === WebSocket.OPEN && ocReady) return ocGateway;
+  return connectOcGateway();
+}
+
+function ocRequest(method, params) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const ws = await getOcGateway();
+      const id = crypto.randomUUID();
+      const t = setTimeout(() => { ocPending.delete(id); reject(new Error('Timeout')); }, 30000);
+      ocPending.set(id, { resolve, reject, timeout: t });
+      ws.send(JSON.stringify({ type: 'req', id, method, params }));
+    } catch (err) { reject(err); }
   });
 }
 
@@ -214,6 +332,10 @@ function detectOpenClaw() {
 detectOpenClaw().then((oc) => {
   if (oc.available) {
     console.log(`  [OpenClaw] Detected (gateway on port ${oc.port})`);
+    // Pre-connect to gateway
+    connectOcGateway().catch(() => {});
+  } else if (oc.installed) {
+    console.log(`  [OpenClaw] Installed but gateway not running (port ${oc.port})`);
   } else {
     console.log('  [OpenClaw] Not detected');
   }
@@ -289,10 +411,13 @@ wss.on('connection', (ws) => {
       }
     }
     // Clean up any active chat streams owned by this connection
-    for (const [id, req] of activeChats) {
-      if (req._ws === ws) {
-        req.destroy();
-        activeChats.delete(id);
+    for (const [chatId, chat] of activeChats) {
+      if (chat._ws === ws) {
+        if (chat.runId) {
+          ocRequest('chat.abort', { runId: chat.runId }).catch(() => {});
+          ocChatCallbacks.delete(chat.runId);
+        }
+        activeChats.delete(chatId);
       }
     }
     // Kill any active search process for this connection
@@ -364,7 +489,7 @@ async function handleMessage(ws, msg) {
       case 'terminal.stop':
         return handleTerminalStop(ws, msg);
       case 'chat.send':
-        return handleChatSend(ws, msg);
+        return await handleChatSend(ws, msg);
       case 'chat.stop':
         return handleChatStop(ws, msg);
       case 'push.register':
@@ -977,110 +1102,45 @@ function handleTerminalStop(ws, { id }) {
   reply(ws, id, { stopped: true });
 }
 
-// --- Chat (OpenClaw Proxy) ---
-function handleChatSend(ws, { id, messages }) {
-  // Use locally-detected OpenClaw config — no need for app to send credentials
-  const port = openClawConfig.port || 18789;
-  const host = openClawConfig.host || '127.0.0.1';
-  const token = openClawConfig.token;
+// --- Chat (OpenClaw Gateway Proxy) ---
+async function handleChatSend(ws, { id, messages }) {
+  try {
+    // Connect to OpenClaw gateway (auto-reconnects if needed)
+    await getOcGateway();
 
-  const body = JSON.stringify({
-    model: 'openclaw:main',
-    messages,
-    stream: true,
-  });
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-openclaw-agent-id': 'main',
-  };
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const req = http.request(
-    {
-      hostname: host,
-      port,
-      path: '/v1/chat/completions',
-      method: 'POST',
-      headers,
-    },
-    (res) => {
-      if (res.statusCode !== 200) {
-        let errorBody = '';
-        res.on('data', (chunk) => (errorBody += chunk));
-        res.on('end', () => {
-          send(ws, { type: 'chat.done', id, error: `OpenClaw error ${res.statusCode}: ${errorBody}` });
-          activeChats.delete(id);
-        });
-        return;
-      }
-
-      let buffer = '';
-      let sentDone = false;
-
-      res.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-          if (trimmed === 'data: [DONE]') {
-            if (!sentDone) {
-              sentDone = true;
-              send(ws, { type: 'chat.done', id });
-              activeChats.delete(id);
-            }
-            return;
-          }
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const json = JSON.parse(trimmed.slice(6));
-              const content = json.choices?.[0]?.delta?.content;
-              if (content) {
-                send(ws, { type: 'chat.stream', id, content });
-              }
-            } catch {}
-          }
-        }
-      });
-
-      res.on('end', () => {
-        if (!sentDone) {
-          sentDone = true;
-          send(ws, { type: 'chat.done', id });
-          activeChats.delete(id);
-        }
-      });
-
-      res.on('error', (err) => {
-        if (!sentDone) {
-          sentDone = true;
-          send(ws, { type: 'chat.done', id, error: err.message });
-          activeChats.delete(id);
-        }
-      });
+    // Extract the last user message from the conversation
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+    if (!lastUserMsg) {
+      return send(ws, { type: 'chat.done', id, error: 'No user message found' });
     }
-  );
 
-  req.on('error', (err) => {
-    send(ws, { type: 'chat.done', id, error: `Connection failed: ${err.message}` });
-    activeChats.delete(id);
-  });
+    // Build a session key — unique per chat conversation
+    const sessionKey = `agent:indieclaw:mobile:${id}`;
+    const idempotencyKey = crypto.randomUUID();
 
-  req._ws = ws;
-  activeChats.set(id, req);
-  req.write(body);
-  req.end();
+    // Send chat request to gateway via WebSocket protocol
+    const result = await ocRequest('chat.send', {
+      sessionKey,
+      message: { role: 'user', content: lastUserMsg.content },
+      idempotencyKey,
+    });
+
+    // Register for streaming events using the runId from the response
+    const runId = result?.runId || result?.id || id;
+    ocChatCallbacks.set(runId, { ws, chatId: id });
+    activeChats.set(id, { runId, _ws: ws });
+
+  } catch (err) {
+    send(ws, { type: 'chat.done', id, error: `OpenClaw: ${err.message}` });
+  }
 }
 
 function handleChatStop(ws, { id, chatId }) {
-  const req = activeChats.get(chatId);
-  if (req) {
-    req.destroy();
+  const chat = activeChats.get(chatId);
+  if (chat && chat.runId) {
+    // Abort the chat via OpenClaw gateway
+    ocRequest('chat.abort', { runId: chat.runId }).catch(() => {});
+    ocChatCallbacks.delete(chat.runId);
     activeChats.delete(chatId);
   }
   reply(ws, id, { stopped: true });
@@ -1304,19 +1364,21 @@ function handleAgentLogs(ws, { id, lines = 200 }) {
 }
 
 // --- Graceful Shutdown ---
-process.on('SIGINT', () => {
-  console.log('\n[agent] Shutting down...');
+function gracefulShutdown() {
   for (const [, term] of terminals) term.kill();
-  for (const [, req] of activeChats) req.destroy();
+  activeChats.clear();
+  ocChatCallbacks.clear();
+  if (ocGateway) { try { ocGateway.close(); } catch {} }
   wss.close();
   if (server) server.close();
   process.exit(0);
+}
+
+process.on('SIGINT', () => {
+  console.log('\n[agent] Shutting down...');
+  gracefulShutdown();
 });
 
 process.on('SIGTERM', () => {
-  for (const [, term] of terminals) term.kill();
-  for (const [, req] of activeChats) req.destroy();
-  wss.close();
-  if (server) server.close();
-  process.exit(0);
+  gracefulShutdown();
 });
